@@ -1,0 +1,52 @@
+{
+  "name": "modelgate",
+  "version": "0.1.0",
+  "description": "Intelligent AI model router — route every LLM call to the cheapest model that can handle it",
+  "type": "module",
+  "main": "dist/index.cjs",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsup src/index.ts --format esm,cjs --dts --clean",
+    "test": "bun test",
+    "lint": "biome check src/ tests/",
+    "lint:fix": "biome check --write src/ tests/",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "bun run build"
+  },
+  "keywords": [
+    "llm",
+    "model-router",
+    "ai",
+    "cost-optimization",
+    "anthropic",
+    "openai",
+    "claude",
+    "haiku",
+    "sonnet",
+    "opus"
+  ],
+  "author": "Michael Kennedy",
+  "license": "MIT",
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.0",
+    "tsup": "^8.3.0",
+    "typescript": "^5.7.0"
+  },
+  "peerDependencies": {
+    "@anthropic-ai/sdk": ">=0.30.0"
+  },
+  "peerDependenciesMeta": {
+    "@anthropic-ai/sdk": {
+      "optional": true
+    }
+  }
+}
