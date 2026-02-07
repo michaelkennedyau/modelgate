@@ -24,15 +24,23 @@ With LLM classifier: 550 fast + 450 quality  = $8.25  (45% saved)
 
 ---
 
+## What's New in v0.2
+
+- **Middleware Pipeline** -- composable, Express-style hooks around every LLM call
+- **Provider Adapters** -- call Anthropic, OpenAI, and Google directly through ModelGate
+- **Streaming** -- `gate.stream()` with automatic model selection
+- **A/B Testing** -- run experiments to measure cost vs quality tradeoffs
+- **5 Built-in Middlewares** -- logging, retry, timeout, caching, cost recording
+
+---
+
 ## Quick Start
 
 ```bash
-bun add modelgate
-# or
 npm install modelgate
 ```
 
-### 1. Minimal -- zero config, heuristic only
+### 1. Classify only (zero config)
 
 ```typescript
 import { ModelGate } from "modelgate";
@@ -40,56 +48,90 @@ import { ModelGate } from "modelgate";
 const gate = new ModelGate();
 
 const result = gate.classify({ message: "What flights go to Tokyo?" });
-// {
-//   tier: "fast",
-//   modelId: "claude-haiku-4-5-20251001",
-//   score: 0.15,
-//   reasons: ["simple query", "short message"]
-// }
+// { tier: "fast", modelId: "claude-haiku-4-5-20251001", score: 0.15, reasons: [...] }
 ```
 
-### 2. Intelligent -- LLM classifier for ambiguous messages
+### 2. Full SDK -- classify + call + middleware
 
 ```typescript
+import { ModelGate, loggingMiddleware, retryMiddleware } from "modelgate";
+
 const gate = new ModelGate({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-  intelligent: true,
+  providers: {
+    anthropic: { apiKey: process.env.ANTHROPIC_API_KEY },
+  },
+  tracking: true,
 });
 
-// Ambiguous message -- heuristic is unsure, LLM classifier kicks in
-const result = await gate.classify({
-  message: "Can you help me figure out the best approach for restructuring our data pipeline?",
-});
-// {
-//   tier: "quality",
-//   modelId: "claude-sonnet-4-5-20250929",
-//   score: 0.65,
-//   reasons: ["llm-classified: moderate complexity"],
-//   classifierUsed: true
-// }
+gate.use(loggingMiddleware());
+gate.use(retryMiddleware({ maxRetries: 2 }));
+
+const response = await gate.chat(
+  [{ role: "user", content: "What's the capital of France?" }],
+  { systemPrompt: "You are a helpful assistant." },
+);
+// Automatically classifies → picks Haiku → calls Anthropic → returns response
+// response.content = "The capital of France is Paris."
+// response.tier = "fast"
+// response.usage = { inputTokens: 25, outputTokens: 12 }
 ```
 
-### 3. Task-based -- known operation types
+### 3. Streaming
 
 ```typescript
-const gate = new ModelGate();
+const chunks = gate.stream(
+  [{ role: "user", content: "Explain quantum computing in simple terms" }],
+);
 
-const result = gate.classifyTask("sentiment_analysis");
-// { tier: "fast", modelId: "claude-haiku-4-5-20251001", score: 1.0, reasons: ["task-type: sentiment_analysis"] }
+for await (const chunk of chunks) {
+  if (chunk.type === "text") process.stdout.write(chunk.text);
+}
+```
 
-const result2 = gate.classifyTask("financial_analysis");
-// { tier: "expert", modelId: "claude-opus-4-6", score: 1.0, reasons: ["task-type: financial_analysis"] }
+### 4. Task-based routing
+
+```typescript
+gate.classifyTask("sentiment_analysis");  // → fast (Haiku)
+gate.classifyTask("code_generation");     // → quality (Sonnet)
+gate.classifyTask("financial_analysis");  // → expert (Opus)
 ```
 
 ---
 
 ## How It Works
 
-ModelGate uses a two-phase classification approach:
+### Two-Phase Classification
 
-### Phase 1: Heuristic Scoring (free, sub-millisecond)
+```
+         Message
+            |
+            v
+   ┌────────────────┐
+   │   Heuristic     │   Phase 1: free, <1ms
+   │   Classifier    │   Score 0.0 - 1.0
+   └───────┬────────┘
+           |
+      Score in 0.3-0.7?
+      /            \
+    No              Yes + intelligent mode
+    |                \
+    v                 v
+ Use score    ┌──────────────┐
+ directly     │  LLM          │   Phase 2: $0.0004
+              │  Classifier   │   Haiku-powered
+              └──────┬───────┘
+                     |
+                     v
+            ┌────────────────┐
+            │  Model          │   Select cheapest model
+            │  Registry       │   in the target tier
+            └────────────────┘
+                     |
+                     v
+          ClassificationResult
+```
 
-Every message gets a complexity score from 0.0 (trivial) to 1.0 (complex) based on:
+#### Phase 1: Heuristic Scoring (free, sub-millisecond)
 
 | Signal | What it detects |
 |--------|----------------|
@@ -98,53 +140,221 @@ Every message gets a complexity score from 0.0 (trivial) to 1.0 (complex) based 
 | Simple query patterns | Single-intent questions, yes/no, factual lookups |
 | Complex keywords | "analyze", "compare", "optimize", "plan" |
 | Multi-step indicators | "first...then", "and then", "if...else" |
-| Analysis language | "pros and cons", "trade-off", "which is better" |
 | Question count | 2+ questions signal higher complexity |
 | Structured content | Numbered lists, bullet points, code blocks |
 | Custom patterns | Your own RegExp rules for domain-specific signals |
 
-This handles roughly 80% of messages with high confidence.
+Handles ~80% of messages with high confidence.
 
-### Phase 2: LLM Classifier (optional, ~$0.0004/call)
+#### Phase 2: LLM Classifier (optional, ~$0.0004/call)
 
-When the heuristic score falls in the ambiguity band (default 0.3-0.7), ModelGate optionally calls a fast LLM (Haiku) to classify the message as SIMPLE, MODERATE, or COMPLEX. This requires an Anthropic API key and `intelligent: true` in your config.
+When the heuristic score falls in the ambiguity band (default 0.3-0.7), ModelGate optionally calls Haiku to classify the message. Requires `apiKey` and `intelligent: true`.
 
-- Cost: ~500 input tokens + 1 output token = **$0.0004 per classification**
-- Cached: identical messages skip re-classification (LRU cache, 1000 entries default)
-- Timeout: falls back to heuristic result if the classifier is slow
+- **Cached:** LRU cache (1000 entries default) -- identical messages skip re-classification
+- **Timeout:** Falls back to heuristic result if the classifier is slow
 
-**The economics:** If 20% of messages hit the classifier, and 60% of those get downgraded from a quality-tier to a fast-tier model, the classifier pays for itself 15x over.
+---
 
-### Flow Diagram
+## Middleware Pipeline
 
+ModelGate v0.2 includes a composable middleware system that wraps `chat()` calls. Middlewares run in registration order using the onion model (like Koa/Express).
+
+```typescript
+import {
+  ModelGate,
+  loggingMiddleware,
+  retryMiddleware,
+  timeoutMiddleware,
+  cachingMiddleware,
+  costRecorderMiddleware,
+} from "modelgate";
+
+const gate = new ModelGate({
+  providers: { anthropic: { apiKey: process.env.ANTHROPIC_API_KEY } },
+  tracking: true,
+});
+
+// Middlewares run in order: logging → retry → timeout → caching → cost
+gate.use(loggingMiddleware());
+gate.use(retryMiddleware({ maxRetries: 2, backoffMs: 100 }));
+gate.use(timeoutMiddleware(30_000));
+gate.use(cachingMiddleware({ maxSize: 500, ttlMs: 300_000 }));
+gate.use(costRecorderMiddleware(gate));
 ```
-         Message / Task
-              |
-              v
-     ┌────────────────┐
-     │   Heuristic     │   Phase 1: free, <1ms
-     │   Classifier    │   Score 0.0 - 1.0
-     └───────┬────────┘
-             |
-        Score in 0.3-0.7?
-        /            \
-      No              Yes + intelligent mode
-      |                \
-      v                 v
-   Use score    ┌──────────────┐
-   directly     │  LLM          │   Phase 2: $0.0004
-                │  Classifier   │   Haiku-powered
-                └──────┬───────┘
-                       |
-                       v
-              ┌────────────────┐
-              │  Model          │   Select cheapest model
-              │  Registry       │   in the target tier
-              └────────────────┘
-                       |
-                       v
-            ClassificationResult
-            { tier, modelId, score, reasons }
+
+### Built-in Middlewares
+
+| Middleware | Purpose | Defaults |
+|-----------|---------|----------|
+| `loggingMiddleware(logger?)` | Log request tier/model and response latency | `console.log` |
+| `retryMiddleware(options?)` | Retry on error with exponential backoff | 2 retries, 100ms |
+| `timeoutMiddleware(ms?)` | Abort if response takes too long | 30,000ms |
+| `cachingMiddleware(options?)` | LRU cache keyed on message content | 500 entries, 5min TTL |
+| `costRecorderMiddleware(tracker)` | Record token usage after each response | -- |
+
+### Custom Middleware
+
+```typescript
+import type { Middleware } from "modelgate";
+
+const myMiddleware: Middleware = async (ctx, next) => {
+  // Before: modify request context
+  ctx.metadata.startTime = Date.now();
+
+  // Call next middleware (or the LLM if last in chain)
+  const response = await next();
+
+  // After: modify or inspect response
+  console.log(`Took ${Date.now() - (ctx.metadata.startTime as number)}ms`);
+  return response;
+};
+
+gate.use(myMiddleware);
+```
+
+---
+
+## Provider Adapters
+
+Call LLMs directly through ModelGate. Providers use `fetch()` internally -- zero SDK dependencies.
+
+### Setup
+
+```typescript
+const gate = new ModelGate({
+  providers: {
+    anthropic: { apiKey: process.env.ANTHROPIC_API_KEY },
+    openai: { apiKey: process.env.OPENAI_API_KEY },
+    google: { apiKey: process.env.GOOGLE_API_KEY },
+  },
+});
+```
+
+### `gate.chat()` -- Complete Response
+
+Classifies the message, picks the right model, calls the provider, returns a unified response.
+
+```typescript
+const response = await gate.chat(
+  [
+    { role: "user", content: "What is 2 + 2?" },
+  ],
+  {
+    systemPrompt: "Answer concisely.",
+    maxTokens: 100,
+    temperature: 0,
+    taskType: "chat",
+  },
+);
+
+// response.content   → "4"
+// response.modelId   → "claude-haiku-4-5-20251001"
+// response.tier      → "fast"
+// response.usage     → { inputTokens: 18, outputTokens: 3 }
+// response.latencyMs → 245
+```
+
+### `gate.stream()` -- Streaming Response
+
+```typescript
+const stream = gate.stream(
+  [{ role: "user", content: "Write a haiku about TypeScript" }],
+  { maxTokens: 100 },
+);
+
+for await (const chunk of stream) {
+  switch (chunk.type) {
+    case "text":
+      process.stdout.write(chunk.text);
+      break;
+    case "usage":
+      console.log("Tokens:", chunk.usage);
+      break;
+    case "done":
+      console.log("Stream complete");
+      break;
+  }
+}
+```
+
+### Using Adapters Directly
+
+```typescript
+import { AnthropicAdapter, OpenAIAdapter, GoogleAdapter } from "modelgate";
+
+const anthropic = new AnthropicAdapter({
+  apiKey: process.env.ANTHROPIC_API_KEY,
+});
+
+const response = await anthropic.chat({
+  model: "claude-haiku-4-5-20251001",
+  messages: [{ role: "user", content: "Hello" }],
+  maxTokens: 100,
+});
+```
+
+### Supported Providers
+
+| Provider | Chat | Streaming | Auth |
+|----------|------|-----------|------|
+| **Anthropic** | Messages API | SSE streaming | `x-api-key` header |
+| **OpenAI** | Chat Completions | SSE streaming | `Bearer` token |
+| **Google** | Gemini `generateContent` | SSE streaming | `?key=` query param |
+
+---
+
+## A/B Testing
+
+Run experiments to measure the impact of routing traffic to cheaper models.
+
+```typescript
+const gate = new ModelGate({
+  experiments: [
+    {
+      name: "cost-savings-test",
+      active: true,
+      variants: [
+        { name: "control", tier: "quality", weight: 0.5 },
+        { name: "cheaper", tier: "fast", weight: 0.5 },
+      ],
+    },
+  ],
+});
+
+// Assign a request to a variant
+const assignment = gate.experiments.assign("cost-savings-test");
+// { experimentName: "cost-savings-test", variantName: "cheaper", tier: "fast", modelId: "claude-haiku-..." }
+
+// After many requests, check the distribution
+const dist = gate.experiments.getDistribution("cost-savings-test");
+// { control: { count: 487, percentage: 48.7 }, cheaper: { count: 513, percentage: 51.3 } }
+```
+
+### Managing Experiments
+
+```typescript
+// Add a new experiment at runtime
+gate.experiments.addExperiment({
+  name: "three-way-split",
+  active: true,
+  variants: [
+    { name: "haiku", tier: "fast", weight: 0.6 },
+    { name: "sonnet", tier: "quality", weight: 0.3 },
+    { name: "opus", tier: "expert", weight: 0.1 },
+  ],
+});
+
+// Pause an experiment
+gate.experiments.setActive("cost-savings-test", false);
+
+// Validate before adding
+const { valid, errors } = ExperimentManager.validate(myExperiment);
+
+// Review assignments
+const assignments = gate.experiments.getAssignments("three-way-split");
+
+// Clear recorded data
+gate.experiments.clearAssignments();
 ```
 
 ---
@@ -198,9 +408,7 @@ const gate = new ModelGate({
 
 ## Task Type Routing
 
-ModelGate ships with default tier mappings for common task types. Use `classifyTask()` to skip heuristic scoring entirely when you know the operation type.
-
-### Default Mappings
+Skip heuristic scoring when you know the operation type.
 
 | Tier | Task Types |
 |------|-----------|
@@ -208,32 +416,26 @@ ModelGate ships with default tier mappings for common task types. Use `classifyT
 | **quality** | `content_generation`, `chat`, `code_generation`, `explanation`, `comparison`, `planning`, `editing`, `research` |
 | **expert** | `financial_analysis`, `legal_analysis`, `strategy`, `architecture`, `audit`, `complex_reasoning` |
 
-### Overriding Defaults
-
 ```typescript
 const gate = new ModelGate({
   taskOverrides: {
-    // Your prompts for content generation work fine on the fast tier
-    content_generation: "fast",
-    // Your chat needs expert-level reasoning
-    chat: "expert",
+    content_generation: "fast",  // downgrade
+    chat: "expert",              // upgrade
   },
 });
-
-gate.classifyTask("content_generation");
-// { tier: "fast", modelId: "claude-haiku-4-5-20251001", ... }
 ```
 
 ---
 
 ## Cost Tracking
 
-Enable tracking to record token usage and calculate savings.
-
 ```typescript
 const gate = new ModelGate({ tracking: true });
 
-// After each LLM call, record usage
+// Automatic with chat() — usage is recorded automatically
+const response = await gate.chat([{ role: "user", content: "Hello" }]);
+
+// Manual recording
 gate.recordUsage({
   taskType: "chat",
   modelId: "claude-haiku-4-5-20251001",
@@ -243,29 +445,12 @@ gate.recordUsage({
   timestamp: Date.now(),
 });
 
-gate.recordUsage({
-  taskType: "code_generation",
-  modelId: "claude-sonnet-4-5-20250929",
-  tier: "quality",
-  inputTokens: 2000,
-  outputTokens: 1500,
-  timestamp: Date.now(),
-});
-
-// Get aggregated stats
 const stats = gate.getStats();
 // {
 //   totalCalls: 2,
 //   totalCost: 0.0235,
-//   byTier: {
-//     fast:    { calls: 1, cost: 0.0015 },
-//     quality: { calls: 1, cost: 0.0285 },
-//     expert:  { calls: 0, cost: 0 }
-//   },
-//   byTaskType: {
-//     chat:            { calls: 1, cost: 0.0015 },
-//     code_generation: { calls: 1, cost: 0.0285 }
-//   },
+//   byTier: { fast: { calls: 1, cost: 0.0015 }, quality: {...}, expert: {...} },
+//   byTaskType: { chat: { calls: 2, cost: 0.0235 } },
 //   savedVsAllQuality: 0.012,
 //   savedVsAllExpert: 0.045
 // }
@@ -281,52 +466,55 @@ const stats = gate.getStats();
 import type { ModelGateConfig } from "modelgate";
 
 const config: ModelGateConfig = {
-  // API key for intelligent classification (Anthropic)
+  // Classification
   apiKey: process.env.ANTHROPIC_API_KEY,
-
-  // Enable LLM-powered classification for ambiguous messages
   intelligent: true,
-
-  // Score threshold: below = fast, at or above = quality/expert (default: 0.4)
   threshold: 0.4,
-
-  // Ambiguity band: scores in this range trigger LLM classifier (default: [0.3, 0.7])
   ambiguityBand: [0.3, 0.7],
+  classifierModel: "claude-haiku-4-5-20251001",
+  classifierCacheSize: 1000,
 
-  // Default provider preference order
-  providerPreference: ["anthropic", "openai", "google"],
-
-  // Enable cost tracking (default: false)
-  tracking: true,
-
-  // Task type -> tier overrides
-  taskOverrides: {
-    content_generation: "fast",
+  // Providers (v0.2)
+  providers: {
+    anthropic: { apiKey: process.env.ANTHROPIC_API_KEY },
+    openai: { apiKey: process.env.OPENAI_API_KEY },
+    google: { apiKey: process.env.GOOGLE_API_KEY },
   },
 
-  // Custom heuristic patterns to extend defaults
+  // Defaults for chat/stream (v0.2)
+  defaultMaxTokens: 1024,
+  defaultTemperature: undefined,  // use provider default
+
+  // Routing
+  providerPreference: ["anthropic", "openai", "google"],
+  taskOverrides: { content_generation: "fast" },
   customPatterns: {
     simple: [/^(yes|no|ok|sure|thanks)$/i],
     complex: [/\b(regulatory|compliance|GAAP)\b/i],
   },
-
-  // Force all traffic to one tier (emergency override)
   forceModel: undefined,
 
-  // Model to use for LLM classifier (default: cheapest fast-tier model)
-  classifierModel: "claude-haiku-4-5-20251001",
+  // Tracking
+  tracking: true,
 
-  // LRU cache size for classifier results (default: 1000)
-  classifierCacheSize: 1000,
+  // A/B Testing (v0.2)
+  experiments: [
+    {
+      name: "cost-test",
+      active: true,
+      variants: [
+        { name: "control", tier: "quality", weight: 0.5 },
+        { name: "cheaper", tier: "fast", weight: 0.5 },
+      ],
+    },
+  ],
 
-  // Custom models to add to registry
+  // Custom models
   customModels: [],
 };
 ```
 
 ### Environment Variables
-
-Environment variables are always respected and override config values:
 
 | Variable | Values | Description |
 |----------|--------|-------------|
@@ -343,73 +531,54 @@ Environment variables are always respected and override config values:
 
 ```typescript
 import { ModelGate } from "modelgate";
+const gate = new ModelGate(config?);
 ```
 
-#### `constructor(config?: ModelGateConfig)`
-
-Create a new ModelGate instance. All config options are optional.
-
-#### `classify(input: ClassifyInput): ClassificationResult | Promise<ClassificationResult>`
-
-Classify a message and return the recommended model. Returns synchronously in heuristic-only mode. Returns a Promise when intelligent mode is enabled and the heuristic score is ambiguous.
-
-```typescript
-// ClassifyInput
-interface ClassifyInput {
-  message: string;
-  messages?: Array<{ role: string; content?: string | unknown }>;
-}
-```
-
-#### `classifyTask(taskType: string): ClassificationResult`
-
-Classify by task type using the default or overridden tier mappings. Always synchronous.
-
-#### `recordUsage(record: UsageRecord): void`
-
-Record a single API call's token usage for cost tracking. Requires `tracking: true` in config.
-
-```typescript
-interface UsageRecord {
-  taskType: string;
-  modelId: string;
-  tier: ModelTier;
-  inputTokens: number;
-  outputTokens: number;
-  timestamp: number;
-}
-```
-
-#### `getStats(): CostStats`
-
-Get aggregated cost statistics. Requires `tracking: true` in config.
-
-```typescript
-interface CostStats {
-  totalCalls: number;
-  totalCost: number;
-  byTier: Record<ModelTier, { calls: number; cost: number }>;
-  byTaskType: Record<string, { calls: number; cost: number }>;
-  savedVsAllQuality: number;
-  savedVsAllExpert: number;
-}
-```
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `classify(input)` | `ClassificationResult` | Classify a message by content |
+| `classifyTask(taskType)` | `ClassificationResult` | Classify by known task type |
+| `chat(messages, options?)` | `Promise<ResponseContext>` | Classify + call provider + return response |
+| `stream(messages, options?)` | `AsyncIterable<StreamChunk>` | Classify + stream from provider |
+| `use(middleware)` | `this` | Add middleware to the pipeline |
+| `recordUsage(record)` | `void` | Record token usage (requires `tracking: true`) |
+| `getStats()` | `CostStats \| null` | Get aggregated cost statistics |
+| `getModel(tier)` | `ModelSpec` | Get the default model for a tier |
+| `experiments` | `ExperimentManager` | Access the A/B experiment manager |
 
 ### Types
 
 ```typescript
 import type {
-  ModelTier,          // "fast" | "quality" | "expert"
-  Provider,           // "anthropic" | "openai" | "google" | "custom"
-  ModelSpec,          // Full model specification with pricing
-  ClassificationResult,
-  ClassifyInput,
-  UsageRecord,
-  CostStats,
-  ModelGateConfig,
-} from "modelgate";
+  // Core
+  ModelTier,              // "fast" | "quality" | "expert"
+  Provider,               // "anthropic" | "openai" | "google" | "custom"
+  ModelSpec,              // Model definition with pricing
+  ClassificationResult,   // Classification output
+  ClassifyInput,          // Classification input
+  ModelGateConfig,        // Full configuration
 
-import { DEFAULT_TASK_TIERS } from "modelgate";
+  // Provider (v0.2)
+  ChatRequest,            // Unified chat request
+  ChatResponse,           // Unified chat response
+  StreamChunk,            // Streaming chunk
+  ProviderAdapter,        // Provider interface
+  ProviderConfig,         // Provider setup
+
+  // Middleware (v0.2)
+  Middleware,              // Middleware function type
+  RequestContext,          // Request flowing through pipeline
+  ResponseContext,         // Response from LLM call
+
+  // A/B Testing (v0.2)
+  Experiment,             // Experiment definition
+  ExperimentVariant,      // Variant with weight
+  ExperimentAssignment,   // Assignment result
+
+  // Tracking
+  UsageRecord,            // Token usage record
+  CostStats,              // Aggregated statistics
+} from "modelgate";
 ```
 
 ---
@@ -421,27 +590,18 @@ import { DEFAULT_TASK_TIERS } from "modelgate";
 | Language | Python | API (any) | TypeScript | **TypeScript** |
 | Self-hosted | Yes | No | Yes | **Yes** |
 | Classification | ML models | Black box | Heuristic only | **Heuristic + LLM** |
+| Provider adapters | No | Yes | No | **Yes (v0.2)** |
+| Streaming | No | Yes | No | **Yes (v0.2)** |
+| Middleware | No | No | No | **Yes (v0.2)** |
+| A/B testing | No | No | No | **Yes (v0.2)** |
 | Cost tracking | No | Dashboard only | No | **Built-in** |
 | Task-type routing | No | No | No | **Yes** |
 | Zero dependencies | No | N/A | Yes | **Yes** |
-| Env var overrides | No | No | No | **Yes** |
 | Works offline | Yes | No | Yes | **Yes (heuristic)** |
-| Price per call | Free | Model cost | Free | **Free or $0.0004** |
-
----
-
-## What This Is NOT
-
-- **Not a proxy/gateway.** ModelGate does not make API calls for you. It tells you _which model_ to use. Your existing code calls the provider.
-- **Not a provider abstraction.** Use Vercel AI SDK, LangChain, or direct SDKs for that. ModelGate sits upstream.
-- **Not an observability platform.** Cost tracking is local and in-memory. For production monitoring, pipe stats to your existing system.
-- **Not ML-based.** No training data, no BERT, no matrix factorization. Heuristics + optional LLM classifier. Simple, predictable, debuggable.
 
 ---
 
 ## Built With
-
-ModelGate was extracted from three production applications -- a travel planner, a client review system, and a financial companion app -- each of which independently solved the model routing problem. This package is the universal solution.
 
 | Dependency | Purpose |
 |-----------|---------|
@@ -450,7 +610,7 @@ ModelGate was extracted from three production applications -- a travel planner, 
 | [tsup](https://tsup.egoist.dev/) | Build (ESM + CJS dual output) |
 | [Biome](https://biomejs.dev/) | Linting and formatting |
 
-Zero runtime dependencies. The Anthropic SDK is an optional peer dependency (only needed for intelligent mode).
+Zero runtime dependencies. 241 tests. ESM + CJS dual output.
 
 ---
 

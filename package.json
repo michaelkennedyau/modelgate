@@ -1,6 +1,6 @@
 {
   "name": "modelgate",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Intelligent AI model router — route every LLM call to the cheapest model that can handle it",
   "type": "module",
   "main": "dist/index.cjs",
