@@ -12,16 +12,24 @@ import type {
   ModelGateConfig,
   ModelSpec,
   ModelTier,
+  ProviderAdapter,
   UsageRecord,
 } from "./types.js";
+import type { ChatRequest, Middleware, RequestContext, ResponseContext, StreamChunk } from "./types.js";
 import { classifyHeuristic } from "./classifiers/heuristic.js";
 import { classifyTask } from "./classifiers/task.js";
 import { getDefaultModel, registerModel } from "./registry/models.js";
 import { getEnvConfig } from "./utils/env.js";
+import { MiddlewarePipeline } from "./middleware/pipeline.js";
+import { ExperimentManager } from "./ab/experiment.js";
+import { createProvider } from "./providers/base.js";
 
 export class ModelGate {
   private readonly config: ModelGateConfig;
   private usageRecords: UsageRecord[] = [];
+  private readonly pipeline: MiddlewarePipeline;
+  private readonly providers: Map<string, ProviderAdapter> = new Map();
+  readonly experiments: ExperimentManager;
 
   constructor(userConfig: ModelGateConfig = {}) {
     // Merge: env vars override user config
@@ -34,6 +42,38 @@ export class ModelGate {
         registerModel(model);
       }
     }
+
+    // Initialize middleware pipeline
+    this.pipeline = new MiddlewarePipeline();
+
+    // Initialize experiment manager
+    this.experiments = new ExperimentManager();
+    if (this.config.experiments) {
+      for (const exp of this.config.experiments) {
+        this.experiments.addExperiment(exp);
+      }
+    }
+
+    // Initialize provider adapters
+    if (this.config.providers) {
+      for (const [name, providerConfig] of Object.entries(this.config.providers)) {
+        if (providerConfig) {
+          this.providers.set(
+            name,
+            createProvider(name as "anthropic" | "openai" | "google", providerConfig),
+          );
+        }
+      }
+    }
+  }
+
+  /**
+   * Add a middleware to the pipeline.
+   * Middlewares run in registration order around chat() calls.
+   */
+  use(middleware: Middleware): this {
+    this.pipeline.use(middleware);
+    return this;
   }
 
   /**
@@ -188,5 +228,121 @@ export class ModelGate {
    */
   getModel(tier: ModelTier): ModelSpec {
     return getDefaultModel(tier);
+  }
+
+  /**
+   * Send a chat request through classification + middleware + provider.
+   *
+   * 1. Classifies the last user message to pick a tier/model
+   * 2. Runs the middleware pipeline
+   * 3. Calls the appropriate provider adapter
+   * 4. Auto-records usage if tracking is enabled
+   */
+  async chat(
+    messages: Array<{ role: string; content: string }>,
+    options?: { systemPrompt?: string; maxTokens?: number; temperature?: number; taskType?: string; signal?: AbortSignal },
+  ): Promise<ResponseContext> {
+    const lastUserMsg = messages.filter((m) => m.role === "user").pop();
+    const classification = lastUserMsg
+      ? this.classify({ message: lastUserMsg.content })
+      : this.classify({ message: "" });
+
+    const model = this.getModelSpec(classification);
+
+    const ctx: RequestContext = {
+      messages,
+      classification,
+      systemPrompt: options?.systemPrompt,
+      maxTokens: options?.maxTokens ?? this.config.defaultMaxTokens ?? 1024,
+      temperature: options?.temperature ?? this.config.defaultTemperature,
+      signal: options?.signal,
+      metadata: { taskType: options?.taskType ?? "chat" },
+    };
+
+    const startTime = Date.now();
+
+    const response = await this.pipeline.execute(ctx, async (reqCtx) => {
+      const provider = this.getProvider(model.provider);
+
+      const chatReq: ChatRequest = {
+        model: model.id,
+        messages: reqCtx.messages,
+        systemPrompt: reqCtx.systemPrompt,
+        maxTokens: reqCtx.maxTokens,
+        temperature: reqCtx.temperature,
+        signal: reqCtx.signal,
+      };
+
+      const result = await provider.chat(chatReq);
+
+      return {
+        content: result.content,
+        modelId: result.modelId,
+        tier: classification.tier,
+        usage: result.usage,
+        stopReason: result.stopReason,
+        latencyMs: Date.now() - startTime,
+        metadata: {},
+      };
+    });
+
+    // Auto-record usage
+    if (this.config.tracking && response.usage) {
+      this.recordUsage({
+        taskType: (ctx.metadata.taskType as string) ?? "chat",
+        modelId: response.modelId,
+        tier: response.tier,
+        inputTokens: response.usage.inputTokens,
+        outputTokens: response.usage.outputTokens,
+      });
+    }
+
+    return response;
+  }
+
+  /**
+   * Stream a chat response through classification + provider.
+   *
+   * Note: Middleware pipeline is not applied to streaming (middleware
+   * operates on complete responses). Classification still runs.
+   */
+  async *stream(
+    messages: Array<{ role: string; content: string }>,
+    options?: { systemPrompt?: string; maxTokens?: number; temperature?: number; signal?: AbortSignal },
+  ): AsyncIterable<StreamChunk> {
+    const lastUserMsg = messages.filter((m) => m.role === "user").pop();
+    const classification = lastUserMsg
+      ? this.classify({ message: lastUserMsg.content })
+      : this.classify({ message: "" });
+
+    const model = this.getModelSpec(classification);
+    const provider = this.getProvider(model.provider);
+
+    const chatReq: ChatRequest = {
+      model: model.id,
+      messages,
+      systemPrompt: options?.systemPrompt,
+      maxTokens: options?.maxTokens ?? this.config.defaultMaxTokens ?? 1024,
+      temperature: options?.temperature ?? this.config.defaultTemperature,
+      signal: options?.signal,
+    };
+
+    yield* provider.stream(chatReq);
+  }
+
+  /** Resolve a provider adapter by name */
+  private getProvider(providerName: string): ProviderAdapter {
+    const provider = this.providers.get(providerName);
+    if (!provider) {
+      throw new Error(
+        `No provider configured for "${providerName}". Add it via config.providers.${providerName}.`,
+      );
+    }
+    return provider;
+  }
+
+  /** Get the model spec for a classification result */
+  private getModelSpec(classification: ClassificationResult): ModelSpec {
+    return getDefaultModel(classification.tier);
   }
 }

@@ -1,6 +1,6 @@
 {
   "name": "modelgate",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Intelligent AI model router — route every LLM call to the cheapest model that can handle it",
   "type": "module",
   "main": "dist/index.cjs",
@@ -13,7 +13,9 @@
       "require": "./dist/index.cjs"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsup src/index.ts --format esm,cjs --dts --clean",
     "test": "bun test",
@@ -30,9 +32,9 @@
     "anthropic",
     "openai",
     "claude",
-    "haiku",
-    "sonnet",
-    "opus"
+    "middleware",
+    "streaming",
+    "ab-testing"
   ],
   "author": "Michael Kennedy",
   "license": "MIT",

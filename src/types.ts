@@ -145,7 +145,178 @@ export interface ModelGateConfig {
 
   /** Custom models to add to registry */
   customModels?: ModelSpec[];
+
+  /** Provider API keys and config (v0.2) */
+  providers?: ProviderConfigs;
+
+  /** A/B experiments (v0.2) */
+  experiments?: Experiment[];
+
+  /** Default max output tokens for chat/stream (v0.2, default: 1024) */
+  defaultMaxTokens?: number;
+
+  /** Default temperature for chat/stream (v0.2) */
+  defaultTemperature?: number;
 }
+
+// ============================================================================
+// DEFAULT TASK TYPES
+// ============================================================================
+
+/**
+ * Common task types with sensible default tier mappings.
+ * Users can override any of these via taskOverrides.
+ */
+// ============================================================================
+// MIDDLEWARE (v0.2)
+// ============================================================================
+
+/** Context passed through the middleware pipeline */
+export interface RequestContext {
+  /** Conversation messages */
+  messages: Array<{ role: string; content: string }>;
+  /** Classification result (set by ModelGate before middleware runs) */
+  classification: ClassificationResult;
+  /** System prompt to prepend */
+  systemPrompt?: string;
+  /** Max output tokens */
+  maxTokens?: number;
+  /** Temperature (0.0-1.0) */
+  temperature?: number;
+  /** Abort signal for cancellation */
+  signal?: AbortSignal;
+  /** Arbitrary metadata (middleware can read/write) */
+  metadata: Record<string, unknown>;
+}
+
+/** Response from an LLM call */
+export interface ResponseContext {
+  /** Generated text content */
+  content: string;
+  /** Model that was actually used */
+  modelId: string;
+  /** Tier that was used */
+  tier: ModelTier;
+  /** Token usage */
+  usage: { inputTokens: number; outputTokens: number };
+  /** Stop reason */
+  stopReason?: string;
+  /** Latency in milliseconds */
+  latencyMs?: number;
+  /** Arbitrary metadata */
+  metadata: Record<string, unknown>;
+}
+
+/** Middleware function — wraps the request/response pipeline */
+export type Middleware = (
+  ctx: RequestContext,
+  next: () => Promise<ResponseContext>,
+) => Promise<ResponseContext>;
+
+// ============================================================================
+// PROVIDER ADAPTERS (v0.2)
+// ============================================================================
+
+/** Unified chat request across all providers */
+export interface ChatRequest {
+  /** Model ID to use */
+  model: string;
+  /** Conversation messages */
+  messages: Array<{ role: string; content: string }>;
+  /** System prompt */
+  systemPrompt?: string;
+  /** Max output tokens (default: 1024) */
+  maxTokens?: number;
+  /** Temperature 0.0-1.0 (default: provider default) */
+  temperature?: number;
+  /** Abort signal */
+  signal?: AbortSignal;
+}
+
+/** Unified chat response */
+export interface ChatResponse {
+  /** Generated content */
+  content: string;
+  /** Model that processed the request */
+  modelId: string;
+  /** Token usage */
+  usage: { inputTokens: number; outputTokens: number };
+  /** Why generation stopped */
+  stopReason?: string;
+}
+
+/** A chunk from a streaming response */
+export interface StreamChunk {
+  /** Chunk type */
+  type: "text" | "usage" | "done";
+  /** Text content (for type=text) */
+  text?: string;
+  /** Token usage (for type=usage or type=done) */
+  usage?: { inputTokens: number; outputTokens: number };
+}
+
+/** Provider adapter interface — implement for each LLM provider */
+export interface ProviderAdapter {
+  /** Provider name */
+  readonly name: Provider;
+  /** Send a chat request and get a complete response */
+  chat(request: ChatRequest): Promise<ChatResponse>;
+  /** Send a chat request and stream the response */
+  stream(request: ChatRequest): AsyncIterable<StreamChunk>;
+}
+
+/** Configuration for a provider adapter */
+export interface ProviderConfig {
+  /** API key */
+  apiKey: string;
+  /** Base URL override */
+  baseUrl?: string;
+  /** Request timeout in ms (default: 30000) */
+  timeout?: number;
+}
+
+// ============================================================================
+// A/B TESTING (v0.2)
+// ============================================================================
+
+/** An experiment that routes traffic between tier variants */
+export interface Experiment {
+  /** Unique experiment name */
+  name: string;
+  /** Variant definitions with traffic weights */
+  variants: ExperimentVariant[];
+  /** Whether the experiment is active */
+  active: boolean;
+}
+
+/** A variant in an A/B experiment */
+export interface ExperimentVariant {
+  /** Variant name (e.g., "control", "cheaper") */
+  name: string;
+  /** Tier to route to */
+  tier: ModelTier;
+  /** Traffic weight (0.0-1.0, all weights in experiment should sum to 1.0) */
+  weight: number;
+}
+
+/** Result of assigning a request to an experiment variant */
+export interface ExperimentAssignment {
+  /** Experiment name */
+  experimentName: string;
+  /** Assigned variant name */
+  variantName: string;
+  /** Tier for this variant */
+  tier: ModelTier;
+  /** Model ID for this variant */
+  modelId: string;
+}
+
+// ============================================================================
+// EXTENDED CONFIG (v0.2)
+// ============================================================================
+
+/** Provider configurations keyed by provider name */
+export type ProviderConfigs = Partial<Record<Provider, ProviderConfig>>;
 
 // ============================================================================
 // DEFAULT TASK TYPES
